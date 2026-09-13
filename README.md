@@ -44,21 +44,26 @@ prompt takes a few extra seconds (Qwen forward).
 - Conditioner provenance: bit-identical to `Disya/Anima-T5-Free-Base`
   `model.safetensors` (sha256 in each file's `__metadata__`).
 
-## License & attribution
+## License
 
-This package contains code only; it does not redistribute Anima or Qwen
-weights (pull them from their own sources — `circlestone-labs/Anima`,
-`Qwen/Qwen3.5-2B-Base`, or the `Disya/Anima-T5-Free-Base` HF repo).
+The **code** in this repository is MIT-licensed — see [LICENSE.md](LICENSE.md).
 
-> “The CircleStone Model is licensed by CircleStone Labs LLC under the
-> CircleStone Non-Commercial License. Copyright CircleStone Labs LLC.
-> IN NO EVENT SHALL CIRCLESTONE LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES
-> OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-> OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH USE OF THIS
-> MODEL.”
+This package contains code only; it does not redistribute any model
+weights. The models it drives are governed by their own licenses:
 
-**The CircleStone Model (Anima) has been modified** for this project
-(the T5-dependent `llm_adapter` frontend is replaced by a T5-free
-conditioner). This is not an official CircleStone Labs product and has
-not been endorsed or validated by CircleStone Labs. See
-[LICENSE.md](LICENSE.md) (CircleStone Labs Non-Commercial License v1.2).
+- **Anima weights** — including the fused T5-free build and the
+  `Disya/Anima-T5-Free-Base` HuggingFace repo — are under the
+  **CircleStone Labs Non-Commercial License v1.2**:
+
+  > “The CircleStone Model is licensed by CircleStone Labs LLC under the
+  > CircleStone Non-Commercial License. Copyright CircleStone Labs LLC.
+  > IN NO EVENT SHALL CIRCLESTONE LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES
+  > OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  > OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH USE OF THIS
+  > MODEL.”
+
+  **The CircleStone Model (Anima) has been modified** (the T5-dependent
+  `llm_adapter` frontend is replaced by a T5-free conditioner); this is
+  not an official CircleStone Labs product and has not been endorsed or
+  validated by CircleStone Labs.
+- **Qwen3.5-2B-Base** — its own HuggingFace license.
