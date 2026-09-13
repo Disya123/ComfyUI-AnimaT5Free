@@ -1,0 +1,4 @@
+__pycache__/
+taps_cache/
+_qwen35_extract/
+*.pyc
