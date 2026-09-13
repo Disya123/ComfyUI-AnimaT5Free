@@ -7,7 +7,7 @@ behave like stock Anima models:
 | File (put in `models/…`) | Stock node that loads it |
 |---|---|
 | `unet/anima-t5free-fused-v0.1.safetensors` (3.97 GB) | **Load Diffusion Model** |
-| `text_encoders/anima-t5free-qwen35-2b.safetensors` (4.62 GB) | **Load CLIP** (any type) |
+| `text_encoders/qwen_35_2b_base.safetensors` (4.62 GB) | **Load CLIP** (any type) |
 
 - **UNet**: frozen Anima DiT + the T5-free conditioner (`conditioner.*`)
   in one file; the dead `llm_adapter` (135M params, T5-dependent) is
