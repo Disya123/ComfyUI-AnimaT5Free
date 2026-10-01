@@ -164,17 +164,30 @@ def _diffusion_loader_hook(original):
             raise RuntimeError("ComfyUI could not detect the F128 diffusion checkpoint")
         base = patcher.model
         attach_runtime(base, receiver, config)
-        # Latent contract follows the checkpoint family, not the carrier
-        # implementation in isolation. native-rows checkpoints (v1 grid /
-        # v2 no-grid) use the stock Anima backbone and therefore keep
-        # Comfy's stock Wan21 normalization. Legacy d1c FT checkpoints
-        # were trained in raw Qwen-VAE coordinates.
-        if str(config.get("carrier", "")).startswith("native-rows"):
-            latent_contract = "stock Wan21 coordinates"
-        else:
+        # Latent contract is an EXPLICIT per-checkpoint field, orthogonal
+        # to the carrier: "raw" = trained in raw Qwen-VAE coordinates
+        # (d1c FT line, native continuation), "wan21" = stock backbone
+        # coordinates. Legacy checkpoints without the field fall back to
+        # the family inference WITH a warning (native-rows stock pair ->
+        # Wan21; d1c FT -> raw).
+        latent_field = str(config.get("latent", "")).strip().lower()
+        if latent_field == "raw":
             base.latent_format = RawWan21()
             base.model_config.latent_format = base.latent_format
             latent_contract = "raw Qwen-VAE coordinates"
+        elif latent_field == "wan21":
+            latent_contract = "stock Wan21 coordinates"
+        elif str(config.get("carrier", "")).startswith("native-rows"):
+            log.warning(
+                "F128: checkpoint has no explicit 'latent' field; "
+                "native-rows stock pair -> assuming stock Wan21. "
+                "Retrain continuation ckpts MUST emit latent=raw."
+            )
+            latent_contract = "stock Wan21 (legacy inferred)"
+        else:
+            base.latent_format = RawWan21()
+            base.model_config.latent_format = base.latent_format
+            latent_contract = "raw (legacy inferred for d1c FT)"
         # Honest size for the memory manager: Comfy estimated the DiT
         # weights already; add the attached receiver on top instead of
         # lying with zero.
