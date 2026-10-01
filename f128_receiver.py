@@ -19,7 +19,7 @@ class F128Receiver(nn.Module):
     remain unchanged. KNW is retained for checkpoint compatibility.
     """
 
-    def __init__(self, state_dict):
+    def __init__(self, state_dict, no_grid=False):
         super().__init__()
         for name in ("Pk", "Qk", "Pv", "Qv", "KNW", "gk", "gv", "s"):
             if name not in state_dict:
@@ -63,6 +63,7 @@ class F128Receiver(nn.Module):
                 nn.Parameter(torch.empty(shapes[name], dtype=torch.float32), requires_grad=False),
             )
         self.base_rank = rank
+        self.no_grid = no_grid
         self.load_state_dict(state_dict, strict=True)
         self.eval()
 
@@ -82,6 +83,14 @@ class F128Receiver(nn.Module):
         dv = torch.nn.functional.silu(h @ self.Bv[block].t()) @ self.Av[block].t()
         k = k + self.gk[block] * dk.view(batch, rows, NH, HD)
         v = v * self.s[block].view(1, 1, NH, 1) + self.gv[block] * dv.view(batch, rows, NH, HD)
+        if self.no_grid:
+            # v2 carrier: no fixed 512 grid, no zero padding: softmax
+            # runs over the Lq live keys only.  Weights trained WITH
+            # the padded grid must not enable this (denominator shift).
+            return (
+                k.permute(0, 2, 1, 3).contiguous(),
+                v.permute(0, 2, 1, 3).contiguous(),
+            )
         k_grid = k.new_zeros(batch, MAX_ROWS, NH, HD)
         v_grid = v.new_zeros(batch, MAX_ROWS, NH, HD)
         k_grid[:, :rows] = k

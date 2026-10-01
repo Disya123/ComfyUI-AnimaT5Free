@@ -37,10 +37,11 @@ import torch
 from torch import nn
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
 
-import f128_dit                        # noqa: E402
+# One package identity: import siblings through the package, so every
+# module (loader, hook, runtime) shares the exact same module objects.
+from . import f128_carrier                # noqa: E402
+from . import f128_dit                    # noqa: E402
 
 NL, RW, EPS = f128_dit.NL, f128_dit.RW, f128_dit.EPS
 
@@ -197,14 +198,18 @@ def _shared_t5tok():
 
 
 def build_x(text, qwen, qtok, t5, cache_dir=None):
-    """d1c X-носитель [n,51200] bf16 из ПОЛНОГО native Qwen forward.
-    Тренеровочный _capture+build_x_aligned-контракт VERBATIM; кэш по
-    хешу текста (f128_cache)."""
+    """d1c X-carrier [n,51200] bf16 from a full native Qwen forward.
+
+    Trainer contract VERBATIM: T5 row map -> masked mean per group ->
+    per-layer RMS; cache f128_cache/*.x.pt. The native-rows carrier is
+    built by build_x_native_only (the hook always emits BOTH carriers;
+    _extra_conds picks per checkpoint, so the encode side never needs
+    to know which model will consume it).
+    """
     text = str(text) if str(text).strip() else " "
     cache = Path(cache_dir) if cache_dir else _HERE / "f128_cache"
     cache.mkdir(parents=True, exist_ok=True)
-    ck = cache / (hashlib.sha256(
-        text.encode()).hexdigest()[:16] + ".x.pt")
+    ck = cache / (hashlib.sha256(text.encode()).hexdigest()[:16] + ".x.pt")
     if ck.is_file():
         return torch.load(ck, map_location="cpu",
                           weights_only=True)["X"]
@@ -268,6 +273,34 @@ def build_x(text, qwen, qtok, t5, cache_dir=None):
     return X
 
 
+def build_x_native_only(text, qwen, qtok, cache_dir=None):
+    """Native-rows носитель [Lq,51200] с отдельным кэшем (.xnat.pt).
+    Для dual-encode, когда домен модели ещё неизвестен (unet не
+    загружен): hook строит d1c + native, extra_conds выбирает."""
+    text = str(text) if str(text).strip() else " "
+    cache = Path(cache_dir) if cache_dir else _HERE / "f128_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    ck = cache / (hashlib.sha256(
+        (text + "\x00native").encode()).hexdigest()[:16] + ".xnat.pt")
+    if ck.is_file():
+        return torch.load(ck, map_location="cpu",
+                          weights_only=True)["X"]
+    with torch.inference_mode():
+        qdev = qwen.get_input_embeddings().weight.device
+        qdevices = {p.device for p in qwen.parameters()}
+        if len(qdevices) != 1 or next(iter(qdevices)) != qdev:
+            qwen.to(qdev)
+        enc = {k: v.to(qdev) for k, v in
+               qtok(text, return_tensors="pt").items()}
+        out = qwen(**enc, use_cache=False,
+                  output_hidden_states=True, return_dict=True)
+        H = torch.stack([h[0].to(torch.bfloat16)
+                         for h in out.hidden_states]).cpu()
+    X = f128_carrier.carrier_from_states_native(H)
+    torch.save({"X": X}, ck)
+    return X
+
+
 def hook_t5free(te):
     """Precompute F128 carrier during CLIPTextEncode, robust to Comfy offload.
 
@@ -296,19 +329,26 @@ def hook_t5free(te):
 
         qdev = te.qwen.get_input_embeddings().weight.device
 
-        # Build F128 carrier FIRST, while Comfy has CLIP/Qwen loaded.
-        X = build_x(text, te.qwen, te.qtok, _shared_t5tok())
-        if X.device.type != "cpu":
-            X = X.cpu()
-
-        meta = {"f128_text": text, "f128_x": X}
+        # Build F128 carriers FIRST, while Comfy has CLIP/Qwen loaded.
+        # ALWAYS dual (d1c + native): _extra_conds picks the carrier the
+        # loaded checkpoint needs, so the encode side never depends on
+        # load order, cached encodes, or global module state.
+        Xd = build_x(text, te.qwen, te.qtok, _shared_t5tok())
+        Xn = build_x_native_only(text, te.qwen, te.qtok)
+        meta = {
+            "f128_text": text,
+            "f128_x_d1c": Xd,
+            "f128_x_native": Xn,
+            "f128_carrier_version": f128_carrier.CARRIER_VERSION_DUAL,
+        }
+        x_shape = f"d1c{tuple(Xd.shape)}+nat{tuple(Xn.shape)}"
 
         # If F128 UNet is already active, stock C0/C1 is unused.
         if f128_dit.F128_CTX.get("f128_loaded", False):
             dtype = getattr(te, "_te_dtype", None) or torch.bfloat16
             cond = torch.zeros((1, 512, 1024), dtype=dtype, device="cpu")
             print(
-                f"[F128] CLIP X {tuple(X.shape)}; "
+                f"[F128] CLIP X {x_shape}; "
                 "F128 active -> stock C0/C1 BYPASSED"
             )
             return (cond, None, meta)
@@ -337,8 +377,8 @@ def hook_t5free(te):
         orig_meta.update(meta)
 
         print(
-            f"[F128] CLIP X {tuple(X.shape)}; "
-            "model not known yet -> stock carrier also produced"
+            f"[F128] CLIP X {x_shape}; "
+            "model not known yet -> dual carriers + stock carrier produced"
         )
         return (cond, pooled, orig_meta)
 

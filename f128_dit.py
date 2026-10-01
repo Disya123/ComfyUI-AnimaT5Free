@@ -416,9 +416,11 @@ def patch_load_diffusion():
                                      rank_map=RANK_MAP, seed=0)
                         res.load_state_dict(res_sd, strict=True)
                         F128_CTX["res"] = res.eval()
+                        F128_CTX["cfg"] = cfg
                         print(f"[F128] ресивер СЛИТНО из unet-файла: "
                               f"{len(res_sd)} тензоров "
-                              f"(step {cfg.get('step')})")
+                              f"(step {cfg.get('step')}, carrier "
+                              f"{cfg.get('carrier', 'd1c')})")
         except Exception as exc:
             raise RuntimeError(
                 f"[F128] не смог прочитать слитный ресивер из "

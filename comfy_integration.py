@@ -122,7 +122,11 @@ def _diffusion_loader_hook(original):
     signature = inspect.signature(original)
 
     def load(sd, *args, **kwargs):
+        from . import f128_dit
         if "f128_marker" not in sd:
+            # Stock checkpoint: drop the F128 session flag so the encode
+            # hook falls back to the full stock path (no stale state).
+            f128_dit.F128_CTX["f128_loaded"] = False
             return original(sd, *args, **kwargs)
         if "f128_config_bytes" not in sd:
             raise ValueError("F128 checkpoint is missing f128_config_bytes")
@@ -134,7 +138,15 @@ def _diffusion_loader_hook(original):
         }
         if not receiver_sd:
             raise ValueError("F128 checkpoint contains no receiver. Use a merged F128 checkpoint.")
-        receiver = F128Receiver(receiver_sd)
+        receiver = F128Receiver(
+            receiver_sd,
+            no_grid=config.get("carrier") == "native-rows-v2",
+        )
+        # Session flag ONLY: lets the encode hook skip the dead stock
+        # C0/C1 pass while an F128 model is the active diffusion model.
+        # Carrier selection is NOT read here: the hook always emits dual
+        # carriers and _extra_conds picks per-model from its own config.
+        f128_dit.F128_CTX["f128_loaded"] = True
         # Normalize net.* before Comfy filters the prefix, preserving the marker
         # for detection. Extract metadata from the already loaded state dict.
         has_net = any(k.startswith("net.") for k in sd)
@@ -152,12 +164,27 @@ def _diffusion_loader_hook(original):
             raise RuntimeError("ComfyUI could not detect the F128 diffusion checkpoint")
         base = patcher.model
         attach_runtime(base, receiver, config)
-        base.latent_format = RawWan21()
-        base.model_config.latent_format = base.latent_format
-        patcher.size = 0  # Comfy may have estimated size before receiver attachment.
+        # Latent contract follows the checkpoint family, not the carrier
+        # implementation in isolation. native-rows checkpoints (v1 grid /
+        # v2 no-grid) use the stock Anima backbone and therefore keep
+        # Comfy's stock Wan21 normalization. Legacy d1c FT checkpoints
+        # were trained in raw Qwen-VAE coordinates.
+        if str(config.get("carrier", "")).startswith("native-rows"):
+            latent_contract = "stock Wan21 coordinates"
+        else:
+            base.latent_format = RawWan21()
+            base.model_config.latent_format = base.latent_format
+            latent_contract = "raw Qwen-VAE coordinates"
+        # Honest size for the memory manager: Comfy estimated the DiT
+        # weights already; add the attached receiver on top instead of
+        # lying with zero.
+        patcher.size += sum(
+            v.numel() * v.element_size() for v in receiver_sd.values()
+        )
         log.info(
-            "Loaded F128 receiver into its owning model (step %s); raw VAE coordinates",
+            "Loaded F128 receiver into its owning model (step %s); %s",
             config.get("step", "unknown"),
+            latent_contract,
         )
         return patcher
 

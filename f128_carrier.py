@@ -9,6 +9,8 @@ import torch
 NL, WIDTH, RW, MAX_ROWS, EPS = 25, 2048, 51200, 512, 1e-6
 DEFAULT_ROW_TOKENIZER = "google/t5-v1_1-xxl"
 CARRIER_VERSION = "d1c-25x2048-bf16-v2"
+CARRIER_VERSION_NATIVE = "native-25x2048-bf16-v1"
+CARRIER_VERSION_DUAL = "dual-25x2048-unresolved-v1"
 
 
 def normalize_text(text):
@@ -55,6 +57,33 @@ def carrier_from_states(hidden_states, row_offsets, qwen_offsets):
     x = torch.cat(rows, dim=1).view(n, NL, WIDTH)
     rms = x.pow(2).mean(dim=(0, 2)).add(EPS).rsqrt()
     result = (x * rms.view(1, NL, 1)).view(n, RW).to(torch.bfloat16)
+    if not torch.isfinite(result).all():
+        raise ValueError("Qwen produced non-finite F128 features")
+    return result
+
+
+def carrier_from_states_native(hidden_states):
+    """v0.3 native-rows carrier: one row per Qwen token, no T5 map.
+
+    [NL,Lq,2048] -> per-layer RMS prenorm -> [Lq, 51200] bf16.  The
+    receiver itself is row-wise (pads K/V to MAX_ROWS internally), so
+    any 1..512 token count is accepted.  This is a NEW carrier domain:
+    trained weights produced with the d1c T5-row pooling must be
+    retrained/continued before this becomes inference-correct.
+    """
+    H = torch.stack(
+        [h.to(device="cpu", dtype=torch.bfloat16)
+         for h in hidden_states[:NL]])
+    if H.ndim != 3 or H.shape[2] != WIDTH:
+        raise ValueError(
+            f"F128 expected Qwen states [layers,tokens,{WIDTH}], got {H.shape}")
+    xb = H.permute(1, 0, 2).float()              # [Lq,NL,2048]
+    if not 1 <= xb.shape[0] <= MAX_ROWS:
+        raise ValueError(
+            f"F128 native rows must be 1..{MAX_ROWS}; got {xb.shape[0]}")
+    rms = xb.pow(2).mean(dim=(0, 2)).add(EPS).rsqrt()
+    result = (xb * rms.view(1, NL, 1)).reshape(
+        xb.shape[0], RW).to(torch.bfloat16)
     if not torch.isfinite(result).all():
         raise ValueError("Qwen produced non-finite F128 features")
     return result

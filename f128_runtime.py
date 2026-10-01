@@ -37,8 +37,32 @@ def _forward(self, x, timesteps, context, **kwargs):
 
 
 def _extra_conds(self, **kwargs):
+    from .f128_carrier import (
+        CARRIER_VERSION_DUAL,
+        CARRIER_VERSION_NATIVE,
+    )
+
+    native_model = str(
+        self._f128_config.get("carrier", "")
+    ).startswith("native-rows")
+    version = kwargs.get("f128_carrier_version")
     direct = kwargs.get("cross_attn")
-    if torch.is_tensor(direct) and direct.ndim == 3 and direct.shape[-1] == RW:
+
+    # IMPORTANT: dual metadata wins over the direct CONDITIONING tensor.
+    # CLIPTextEncode can execute before the diffusion checkpoint is known; in
+    # that case the TE deliberately emits both d1c and native carriers from one
+    # Qwen forward.  The direct tensor is only a transport/compatibility value.
+    if version == CARRIER_VERSION_DUAL:
+        carrier = kwargs.get(
+            "f128_x_native" if native_model else "f128_x_d1c"
+        )
+        if not torch.is_tensor(carrier):
+            raise ValueError(
+                "F128 dual conditioning is missing the carrier this "
+                f"checkpoint needs ({'native' if native_model else 'd1c'}). "
+                "Re-encode both prompts with the bundled text encoder."
+            )
+    elif torch.is_tensor(direct) and direct.ndim == 3 and direct.shape[-1] == RW:
         carrier = direct
     else:
         carrier = kwargs.get("f128_x")
@@ -47,23 +71,34 @@ def _extra_conds(self, **kwargs):
                 "F128 needs conditioning from the bundled Anima Qwen text encoder. "
                 "Re-encode both prompts after installing this package."
             )
-        if carrier.ndim == 2:
-            carrier = carrier.unsqueeze(0)
+
+    if carrier.ndim == 2:
+        carrier = carrier.unsqueeze(0)
     if carrier.ndim != 3 or carrier.shape[-1] != RW or not 1 <= carrier.shape[1] <= 512:
         raise ValueError(f"Invalid F128 carrier shape {tuple(carrier.shape)}")
-    version = kwargs.get("f128_carrier_version")
-    if version is not None and version != CARRIER_VERSION:
-        raise ValueError(
-            "F128 conditioning uses an incompatible carrier version; re-encode prompts"
-        )
-    tokenizer = kwargs.get("f128_row_tokenizer")
-    expected = self._f128_config.get("t5tok_name", DEFAULT_ROW_TOKENIZER)
-    if tokenizer is not None and tokenizer != expected:
-        raise ValueError(f"F128 expects row tokenizer {expected!r}, got {tokenizer!r}")
+
+    if version is not None and version != CARRIER_VERSION_DUAL:
+        expected = CARRIER_VERSION_NATIVE if native_model else CARRIER_VERSION
+        if version != expected:
+            raise ValueError(
+                f"F128 carrier was encoded as {version!r} but this "
+                f"checkpoint needs {expected!r} (carrier="
+                f"{self._f128_config.get('carrier', 'd1c')!r}). "
+                "Re-encode both prompts with the bundled text encoder."
+            )
+
+    # Native rows do not depend on a T5 row tokenizer.  Keep the legacy check
+    # only for d1c checkpoints, where row-tokenizer identity is part of the
+    # carrier contract.
+    if not native_model:
+        tokenizer = kwargs.get("f128_row_tokenizer")
+        expected = self._f128_config.get("t5tok_name", DEFAULT_ROW_TOKENIZER)
+        if tokenizer is not None and tokenizer != expected:
+            raise ValueError(f"F128 expects row tokenizer {expected!r}, got {tokenizer!r}")
+
     clean = {k: v for k, v in kwargs.items() if k not in ("t5xxl_ids", "t5xxl_weights")}
     clean["cross_attn"] = carrier
-    # Comfy Anima uses CONDRegular: unequal prompt lengths run separately,
-    # rather than repeating carrier rows (which would break zero padding).
+    # Comfy Anima uses CONDRegular: unequal prompt lengths run separately.
     return self._f128_original_extra_conds(**clean)
 
 

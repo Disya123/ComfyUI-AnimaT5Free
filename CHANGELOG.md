@@ -1,3 +1,9 @@
+## Native-row graph-order fix
+
+- F128/dual CLIP encoding now caches both legacy d1c and native-row carriers from one Qwen forward.
+- Runtime selects the carrier required by the loaded checkpoint even when CLIPTextEncode executed first.
+- Native-row checkpoints no longer validate the irrelevant T5 row-tokenizer identity.
+
 # 0.2.0
 
 - Replace global receiver/holder/activation state with model-owned receivers

@@ -16,10 +16,13 @@ from .cache import TensorCache, cache_root, decode_json, extract_qwen
 from .configuration_anima_t5free import AnimaT5FreeConfig
 from .f128_carrier import (
     CARRIER_VERSION,
+    CARRIER_VERSION_DUAL,
+    CARRIER_VERSION_NATIVE,
     DEFAULT_ROW_TOKENIZER,
     RW,
     capture_states,
     carrier_from_states,
+    carrier_from_states_native,
     load_row_tokenizer,
     normalize_text,
 )
@@ -111,7 +114,9 @@ class AnimaT5FreeTEModel(nn.Module):
         row_json = self.row_tokenizer.backend_tokenizer.to_str() if mode != "t5free" else "none"
         namespace = json.dumps(
             {
-                "version": CARRIER_VERSION,
+                # F128/dual cache must never reuse the old d1c-only cache:
+                # one Qwen forward now stores BOTH legacy d1c and native rows.
+                "version": CARRIER_VERSION_DUAL if mode != "t5free" else CARRIER_VERSION,
                 "qwen": self.source_id,
                 "row_tokenizer": hashlib.sha256(row_json.encode()).hexdigest(),
                 "layers": self.cfg.qwen_layers,
@@ -140,13 +145,17 @@ class AnimaT5FreeTEModel(nn.Module):
             if tap.dtype != torch.float16 or not torch.isfinite(tap).all():
                 return False
         if need_f128:
-            x = data.get("X")
-            if not torch.is_tensor(x) or x.ndim != 2 or x.shape[1] != RW:
-                return False
-            if not 1 <= x.shape[0] <= 512 or x.dtype != torch.bfloat16:
-                return False
-            if not torch.isfinite(x).all():
-                return False
+            # Order-independent F128 encoding carries both domains.  Comfy may
+            # execute CLIPTextEncode before the diffusion checkpoint is loaded,
+            # so the text encoder cannot safely guess d1c vs native rows.
+            for key in ("X_d1c", "X_native"):
+                x = data.get(key)
+                if not torch.is_tensor(x) or x.ndim != 2 or x.shape[1] != RW:
+                    return False
+                if not 1 <= x.shape[0] <= 512 or x.dtype != torch.bfloat16:
+                    return False
+                if not torch.isfinite(x).all():
+                    return False
         return True
 
     def _features(self, text, mode):
@@ -162,9 +171,14 @@ class AnimaT5FreeTEModel(nn.Module):
             raise ValueError("Configured Qwen tap is outside the captured hidden states")
         data = {"taps": {layer: states[layer] for layer in self.cfg.qwen_layers}}
         if need_f128:
+            # Build both carriers from the SAME Qwen forward.  This removes the
+            # graph-order race: the diffusion checkpoint may be resolved only
+            # after CLIPTextEncode, and _extra_conds will select the matching
+            # carrier at sampling time.
             rows = self.row_tokenizer(text, return_offsets_mapping=True).offset_mapping
             offsets = self.qtok(text, return_offsets_mapping=True).offset_mapping
-            data["X"] = carrier_from_states(states, rows, offsets)
+            data["X_d1c"] = carrier_from_states(states, rows, offsets)
+            data["X_native"] = carrier_from_states_native(states)
         if self.cache_enabled:
             try:
                 cache.write(text, data)
@@ -190,14 +204,17 @@ class AnimaT5FreeTEModel(nn.Module):
         metadata = {}
         if mode != "t5free":
             metadata = {
-                "f128_x": features["X"],
+                "f128_x_d1c": features["X_d1c"],
+                "f128_x_native": features["X_native"],
                 "f128_row_tokenizer": self.row_tokenizer_name,
-                "f128_carrier_version": CARRIER_VERSION,
+                "f128_carrier_version": CARRIER_VERSION_DUAL,
             }
         if mode == "f128":
-            # Direct carrier output also lets standard CONDITIONING transforms
-            # operate on F128. No C0/C1 evaluation in explicit F128 mode.
-            return features["X"].unsqueeze(0), None, metadata
+            # A CONDITIONING object still needs a concrete cross_attn tensor.
+            # Use d1c only as the transport value; F128 runtime MUST select
+            # f128_x_d1c/f128_x_native from metadata when version == DUAL.
+            # This keeps explicit F128 mode order-independent too.
+            return features["X_d1c"].unsqueeze(0), None, metadata
         if not raw_text.strip():
             conditioning = self._zero_conditioning()
         else:
