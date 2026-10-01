@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """AnimaT5Free configuration.
 
 T5-free text conditioning frontend for Anima: Qwen3.5-2B taps ->
@@ -10,6 +9,7 @@ config.json keeps the parameters in nested dicts (conditioner.*, sampler.*)
 for readability; this class promotes them to flat attributes so the model
 class can read config.qwen_layers, config.cfg, ... directly.
 """
+
 from transformers import PretrainedConfig
 
 
@@ -51,7 +51,7 @@ class AnimaT5FreeConfig(PretrainedConfig):
         self.segmenter_hidden = segmenter_hidden
         self.max_prompt_bytes = max_prompt_bytes
         self.pos_buckets = [list(p) for p in pos_buckets]
-        self.len_buckets = [list(l) for l in len_buckets]
+        self.len_buckets = [list(bucket) for bucket in len_buckets]
         self.mu_keys = list(mu_keys or [])
         self.cfg = cfg
         self.steps = steps
@@ -64,8 +64,7 @@ class AnimaT5FreeConfig(PretrainedConfig):
         # promote nested dicts from a written config.json (round-trip)
         cond = kwargs.pop("conditioner", None)
         if isinstance(cond, dict):
-            for k in ("context_dim", "max_rows", "feature_dim",
-                      "qwen_layers"):
+            for k in ("context_dim", "max_rows", "feature_dim", "qwen_layers"):
                 if k in cond:
                     setattr(self, k, cond[k])
             r = cond.get("refiner") or {}
@@ -73,20 +72,17 @@ class AnimaT5FreeConfig(PretrainedConfig):
                 self.refiner_width = r.get("width", self.refiner_width)
                 self.refiner_heads = r.get("heads", self.refiner_heads)
                 self.refiner_mlp = r.get("mlp", self.refiner_mlp)
-                self.refiner_blocks = r.get("blocks",
-                                             self.refiner_blocks)
+                self.refiner_blocks = r.get("blocks", self.refiner_blocks)
             sg = cond.get("segmenter") or {}
             if sg:
-                self.segmenter_hidden = sg.get("hidden",
-                                                self.segmenter_hidden)
-                self.max_prompt_bytes = sg.get("max_prompt_bytes",
-                                               self.max_prompt_bytes)
+                self.segmenter_hidden = sg.get("hidden", self.segmenter_hidden)
+                self.max_prompt_bytes = sg.get("max_prompt_bytes", self.max_prompt_bytes)
             if isinstance(cond.get("c0"), dict) and cond["c0"].get("mu_keys"):
                 self.mu_keys = list(cond["c0"]["mu_keys"])
             if cond.get("pos_buckets"):
                 self.pos_buckets = [list(p) for p in cond["pos_buckets"]]
             if cond.get("len_buckets"):
-                self.len_buckets = [list(l) for l in cond["len_buckets"]]
+                self.len_buckets = [list(bucket) for bucket in cond["len_buckets"]]
         samp = kwargs.pop("sampler", None)
         if isinstance(samp, dict):
             self.cfg = samp.get("cfg", self.cfg)

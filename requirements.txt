@@ -1,0 +1,6 @@
+# Torch is provided by ComfyUI; keep its installed CUDA build.
+transformers>=5.2,<6
+safetensors>=0.4
+numpy>=1.24
+sentencepiece>=0.2
+filelock>=3.13

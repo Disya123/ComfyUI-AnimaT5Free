@@ -1,55 +1,43 @@
-# -*- coding: utf-8 -*-
-"""Stock-flow text encoder for ComfyUI-AnimaT5Free.
+"""Comfy text-encoder API for the existing bundled Qwen/C0/C1 file.
 
-AnimaT5FreeTokenizer + AnimaT5FreeTEModel implement the comfy text
-encoder API at the CLIP-wrapper level:
-
-  CLIPLoader(anima-t5free-qwen35-2b.safetensors)
-    -> CLIPTextEncode(text)
-       -> tokenize_with_weights -> {"anima_t5free_text": text}
-       -> encode_token_weights -> the T5-free carrier (Qwen3.5-2B taps
-          at layers 16/22 -> d1 grid -> C0 -> C1 -> bf16/fp16 carrier)
-    -> standard CONDITIONING; the Anima DiT consumes it raw
-       (extra_conds with no t5xxl_ids never touches llm_adapter)
-
-The qwen weights, tokenizer, our config and lexicon all live inside the
-single TE safetensors (split_files style), extracted on load.
+The default emits the original C0/C1 conditioning plus F128 metadata. It is
+independent of which diffusion models have been loaded. Both paths share one
+Qwen forward. An optional tokenizer option selects only one path.
 """
+
 import hashlib
 import json
-from pathlib import Path
+import logging
 
 import torch
 from torch import nn
 
-_HERE = Path(__file__).resolve().parent
-import sys
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+from .cache import TensorCache, cache_root, decode_json, extract_qwen
+from .configuration_anima_t5free import AnimaT5FreeConfig
+from .f128_carrier import (
+    CARRIER_VERSION,
+    DEFAULT_ROW_TOKENIZER,
+    RW,
+    capture_states,
+    carrier_from_states,
+    load_row_tokenizer,
+    normalize_text,
+)
+from .modeling_anima_t5free import AnimaT5FreeModel
 
-from configuration_anima_t5free import AnimaT5FreeConfig   # noqa: E402
-from modeling_anima_t5free import AnimaT5FreeModel         # noqa: E402
-
-
-def _bytes_to_str(t):
-    return bytes(t.cpu().numpy().tolist()).decode("utf-8")
-
-
-def _norm_lex(raw):
-    return {k: (int(v[0][0]), tuple(int(r) for r in v[0][1]))
-            for k, v in raw.items()}
+log = logging.getLogger(__name__)
 
 
 class AnimaT5FreeTokenizer:
-    """Comfy tokenizer API shim: carries the RAW text to the TE."""
-
-    def __init__(self, embedding_directory=None, tokenizer_data={},
-                 **kwargs):
+    def __init__(self, embedding_directory=None, tokenizer_data=None, **kwargs):
         pass
 
     def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
-        return {"anima_t5free_text": text,
-                "anima_t5free_pairs": [[(0, 1.0)]]}
+        options = kwargs.get("tokenizer_options", {})
+        return {
+            "anima_t5free_text": str(text),
+            "anima_text_mode": options.get("anima_text_mode"),
+        }
 
     def untokenize(self, token_weight_pair):
         return token_weight_pair
@@ -62,94 +50,171 @@ class AnimaT5FreeTokenizer:
 
 
 class AnimaT5FreeTEModel(nn.Module):
-    def __init__(self, device="cpu", dtype=None, model_options={},
-                 **kwargs):
+    def __init__(self, device="cpu", dtype=None, model_options=None, **kwargs):
         super().__init__()
-        self.dtypes = {dtype} if dtype is not None else set()
+        self.dtypes = {torch.float16, torch.float32}
         self._te_dtype = dtype
-        self.cond = None           # AnimaT5FreeModel (conditioner)
-        self.qwen = None           # Qwen3.5-2B-Base (transformers)
+        self.options = dict(model_options or {})
+        self.default_mode = self.options.get("anima_text_mode", "dual")
+        self.cache_enabled = True
+        self.qwen = None
+        self.cond = None
         self.qtok = None
-        self.lex = None
+        self.row_tokenizer = None
+        self.row_tokenizer_name = self.options.get("anima_row_tokenizer", DEFAULT_ROW_TOKENIZER)
         self.cfg = None
+        self.lex = None
+        self.source_id = None
 
-    # ---- comfy CLIP API no-ops ------------------------------------------
     def set_clip_options(self, options):
         pass
 
     def reset_clip_options(self):
         pass
 
-    # ---- weights: everything comes from the single TE safetensors -------
     def load_sd(self, sd):
-        cond_sd = {k: v for k, v in sd.items()
-                   if k.startswith("conditioner.")}
-        assert cond_sd, "not an Anima-T5-Free TE file (no conditioner.*)"
-        self.cfg = AnimaT5FreeConfig(
-            **json.loads(_bytes_to_str(sd["t5free_config_bytes"])))
-        cond = AnimaT5FreeModel(self.cfg)
-        cond.load_state_dict(cond_sd, strict=True)
-        self.cond = cond.eval()
-        self.lex = _norm_lex(json.loads(
-            _bytes_to_str(sd["t5free_lexicon_bytes"])))
-
-        # qwen part -> extract to a local HF-style dir, load via transformers
-        exdir = _HERE / "_qwen35_extract"
-        exdir.mkdir(parents=True, exist_ok=True)
-        (exdir / "config.json").write_text(
-            _bytes_to_str(sd["t5free_qwen_config_bytes"]), encoding="utf-8")
-        (exdir / "tokenizer.json").write_text(
-            _bytes_to_str(sd["t5free_tokenizer_json_bytes"]),
-            encoding="utf-8")
-        (exdir / "tokenizer_config.json").write_text(
-            _bytes_to_str(sd["t5free_tokenizer_config_bytes"]),
-            encoding="utf-8")
-        qwen_sd = {k: v for k, v in sd.items()
-                   if not k.startswith(("conditioner.", "t5free_"))}
-        import safetensors.torch
-        safetensors.torch.save_file(qwen_sd, str(exdir / "model.safetensors"))
-        del qwen_sd
+        if self.qwen is not None:
+            raise ValueError("Anima text encoder expects exactly one bundled state dictionary")
+        config = decode_json(sd["t5free_config_bytes"], "t5free_config_bytes")
+        self.cfg = AnimaT5FreeConfig(**config)
+        self.cond = AnimaT5FreeModel(self.cfg).eval().requires_grad_(False)
+        self.cond.load_state_dict(
+            {k: v for k, v in sd.items() if k.startswith("conditioner.")}, strict=True
+        )
+        raw_lexicon = decode_json(sd["t5free_lexicon_bytes"], "t5free_lexicon_bytes")
+        self.lex = {k: (int(v[0][0]), tuple(map(int, v[0][1]))) for k, v in raw_lexicon.items()}
+        directory, self.source_id = extract_qwen(sd, cache_root())
         from transformers import AutoModel, AutoTokenizer
-        self.qwen = AutoModel.from_pretrained(
-            str(exdir), dtype=torch.float16, local_files_only=True).eval()
-        for p in self.qwen.parameters():
-            p.requires_grad_(False)
-        self.qtok = AutoTokenizer.from_pretrained(
-            str(exdir), local_files_only=True)
-        return ([], [])
 
-    # ---- encoding: the proven T5-free chain --------------------------------
-    def _taps(self, text):
-        cache = _HERE / "taps_cache"
-        cache.mkdir(parents=True, exist_ok=True)
-        tp = cache / (hashlib.sha256(text.encode()).hexdigest()[:16]
-                      + ".taps.pt")
-        if not tp.is_file():
-            enc = self.qtok(text, return_tensors="pt", truncation=False)
-            with torch.no_grad():
-                hs = self.qwen(
-                    **{k: v.to(self.qwen.device) for k, v in enc.items()},
-                    output_hidden_states=True).hidden_states
-            torch.save({L: hs[L][0].half().cpu()
-                        for L in self.cfg.qwen_layers}, tp)
-        return tp
+        self.qwen = (
+            AutoModel.from_pretrained(
+                str(directory),
+                dtype=torch.float16,
+                local_files_only=True,
+                attn_implementation="sdpa",
+            )
+            .eval()
+            .requires_grad_(False)
+        )
+        self.qtok = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
+        if not self.qtok.is_fast:
+            raise ValueError("Anima conditioning requires a fast Qwen tokenizer")
+        # No T5 model, receiver or diffusion-model reference is held by the TE.
+        return [], []
 
-    def encode_token_weights(self, token_weight_pairs):
-        text = token_weight_pairs["anima_t5free_text"] \
-            if isinstance(token_weight_pairs, dict) else token_weight_pairs
-        if not str(text).strip():
-            z = torch.zeros((1, self.cfg.max_rows, self.cfg.context_dim),
-                            dtype=self._te_dtype or torch.bfloat16,
-                            device=self.cond.device)
-            return (z, None, {})
-        tp = self._taps(text)
-        carrier = self.cond.conditioning(text, self.qtok, self.lex, str(tp))
-        if self._te_dtype is not None:
-            carrier = carrier.to(self._te_dtype)
-        return (carrier, None, {})
+    def _cache(self, mode):
+        import tokenizers
+        import transformers
+
+        if mode != "t5free" and self.row_tokenizer is None:
+            self.row_tokenizer = load_row_tokenizer(self.row_tokenizer_name)
+        row_json = self.row_tokenizer.backend_tokenizer.to_str() if mode != "t5free" else "none"
+        namespace = json.dumps(
+            {
+                "version": CARRIER_VERSION,
+                "qwen": self.source_id,
+                "row_tokenizer": hashlib.sha256(row_json.encode()).hexdigest(),
+                "layers": self.cfg.qwen_layers,
+                "torch": torch.__version__,
+                "transformers": transformers.__version__,
+                "tokenizers": tokenizers.__version__,
+                "mode": mode,
+                "execution_device": str(self.qwen.get_input_embeddings().weight.device)
+                if self.qwen is not None
+                else "unknown",
+                "qwen_dtype": str(self.qwen.get_input_embeddings().weight.dtype)
+                if self.qwen is not None
+                else "unknown",
+            },
+            sort_keys=True,
+        )
+        return TensorCache(cache_root(), namespace)
+
+    def _valid_features(self, data, need_f128):
+        if not isinstance(data, dict) or not isinstance(data.get("taps"), dict):
+            return False
+        for layer in self.cfg.qwen_layers:
+            tap = data["taps"].get(layer)
+            if not torch.is_tensor(tap) or tap.ndim != 2 or tap.shape[-1] != 2048:
+                return False
+            if tap.dtype != torch.float16 or not torch.isfinite(tap).all():
+                return False
+        if need_f128:
+            x = data.get("X")
+            if not torch.is_tensor(x) or x.ndim != 2 or x.shape[1] != RW:
+                return False
+            if not 1 <= x.shape[0] <= 512 or x.dtype != torch.bfloat16:
+                return False
+            if not torch.isfinite(x).all():
+                return False
+        return True
+
+    def _features(self, text, mode):
+        cache = self._cache(mode)
+        data = cache.read(text) if self.cache_enabled else None
+        need_f128 = mode != "t5free"
+        if data is not None and self._valid_features(data, need_f128):
+            return data
+        if data is not None:
+            log.warning("Ignoring invalid cached Anima features for model %s", self.source_id)
+        states = capture_states(self.qwen, self.qtok, text)
+        if max(self.cfg.qwen_layers) >= len(states):
+            raise ValueError("Configured Qwen tap is outside the captured hidden states")
+        data = {"taps": {layer: states[layer] for layer in self.cfg.qwen_layers}}
+        if need_f128:
+            rows = self.row_tokenizer(text, return_offsets_mapping=True).offset_mapping
+            offsets = self.qtok(text, return_offsets_mapping=True).offset_mapping
+            data["X"] = carrier_from_states(states, rows, offsets)
+        if self.cache_enabled:
+            try:
+                cache.write(text, data)
+            except OSError as exc:
+                log.warning("Could not persist Anima prompt features: %s", exc)
+        return data
+
+    @torch.no_grad()
+    def encode_token_weights(self, tokens):
+        mode = (
+            (tokens.get("anima_text_mode") or self.default_mode)
+            if isinstance(tokens, dict)
+            else self.default_mode
+        )
+        if mode not in ("dual", "f128", "t5free"):
+            raise ValueError(f"Unknown Anima text mode {mode!r}")
+        raw_text = tokens["anima_t5free_text"] if isinstance(tokens, dict) else str(tokens)
+        # Original C0/C1 uncond is zeros. F128 uncond is the live single-space path.
+        if mode == "t5free" and not raw_text.strip():
+            return self._zero_conditioning(), None, {}
+        text = normalize_text(raw_text)
+        features = self._features(text, mode)
+        metadata = {}
+        if mode != "t5free":
+            metadata = {
+                "f128_x": features["X"],
+                "f128_row_tokenizer": self.row_tokenizer_name,
+                "f128_carrier_version": CARRIER_VERSION,
+            }
+        if mode == "f128":
+            # Direct carrier output also lets standard CONDITIONING transforms
+            # operate on F128. No C0/C1 evaluation in explicit F128 mode.
+            return features["X"].unsqueeze(0), None, metadata
+        if not raw_text.strip():
+            conditioning = self._zero_conditioning()
+        else:
+            conditioning = self.cond.conditioning(text, self.qtok, self.lex, features["taps"])
+            if self._te_dtype is not None:
+                conditioning = conditioning.to(self._te_dtype)
+            conditioning = conditioning.cpu()
+        return conditioning, None, metadata
+
+    def _zero_conditioning(self):
+        return torch.zeros(
+            (1, self.cfg.max_rows, self.cfg.context_dim),
+            dtype=self._te_dtype or torch.bfloat16,
+        )
 
 
-class _AnimaT5FreeClipTarget:
+class AnimaT5FreeClipTarget:
     clip = AnimaT5FreeTEModel
     tokenizer = AnimaT5FreeTokenizer
     params = {}

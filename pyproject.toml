@@ -1,0 +1,23 @@
+[project]
+name = "comfyui-anima-t5free"
+version = "0.2.0"
+description = "Anima T5-Free and model-scoped F128 conditioning for ComfyUI"
+requires-python = ">=3.10"
+license = {file = "LICENSE.md"}
+dependencies = ["transformers>=5.2,<6", "safetensors>=0.4", "numpy>=1.24", "sentencepiece>=0.2", "filelock>=3.13"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"comfy_integration.py" = ["E402"]

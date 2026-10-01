@@ -1,4 +1,12 @@
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+build/
+dist/
+# Old versions wrote these into the plugin directory.
+f128_cache/
 taps_cache/
 _qwen35_extract/
-*.pyc
